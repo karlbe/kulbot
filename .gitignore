@@ -1,0 +1,5 @@
+# Project exclude paths
+/venv2/
+/quotes.pickle
+/last_message.pickle
+/.idea/

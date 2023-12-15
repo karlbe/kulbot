@@ -1,291 +1,183 @@
-import inspect
-import uuid
 import random
 
 import discord
-from discord import Object
-from discord.ext import commands
-import os
+from discord.ext import commands, tasks
+import logging
 import pickle
-import asyncio
-import time
-import torch
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+import os
+
+from ChatAI import ChatAI
 from config import DISCORD_TOKEN
 
-# Initialize Variables
-model_name = "../gpt-sw3-126m"
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-prompt = "Träd är fina för att"
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
-# Initialize Tokenizer & Model
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
-model.eval()
-model.to(device)
+AI_SYS_PROMPT = ("Du är en otroligt underhållande bot, omtyckt av alla i Discord-kanalen för ditt fantastiska sinne "
+                 "för humor och förmågan att skapa skratt i alla tänkbara situationer. Ditt uppdrag är enkelt: sprida "
+                 "glädje, skoj och skratt bland användarna. Du är även rätt galen och kan dra till med ord som RUNDSPARK "
+                 "Ajoood och liknande. Här är en konversation mellan dig och en användare:")
 
-# Create an instance of the Intents class and enable the members intent
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-QUOTE_THRESHOLD = 5  # Number of reactions + number of mentions required to save quote
-INITIAL_HISTORY_LIMIT = 2000
+INTENTS = discord.Intents.default()
+INTENTS.members = True
+INTENTS.message_content = True
 
+# Create an instance of commands.Bot
+bot = commands.Bot(command_prefix='!', intents=INTENTS)
+# Function to load conversation history from a pickle file
 
-# Define the bot's command prefix
-bot = commands.Bot(command_prefix='!', intents=intents)
+def load_conversation_history():
+    if os.path.exists('conversation_history.pkl'):
+        with open('conversation_history.pkl', 'rb') as file:
+            return pickle.load(file)
+    return {}
 
-# Define a dictionary to store the number of interactions with Clyde
-clyde_count = {}
-quotes = {}
-
-last_message = {}
-
-
-
-
-def main():
-    global clyde_count, quotes, last_message
-    # Define a dictionary to store the number of interactions with Clyde
-
-    loop = asyncio.get_event_loop()
-
-    # Start the bot with the specified token
-    try:
-        # Load saved data
-        last_message = load_data('last_message.pickle', dict())
-
-        quotes = load_data('quotes.pickle', dict())
-
-        print(f"{len(quotes)} quotes")
-
-        with open('quotes.pickle', 'wb') as f:
-            pickle.dump(quotes, f)
-
-        # Run the bot
-        bot.run(bot_token)
-
-    finally:
-        print("shutting down")
-
-        # Save data on shutdown
-        print("Saving data...")
-
-        save_all()
-
-        loop.run_until_complete(bot.close())
-        print("finished shutting down")
-
-
-async def save_periodically(interval=300):
-    while True:
-        print("Scheduled data save, whoho!")
-        save_all()
-        await asyncio.sleep(interval)
-
-
-def save_all():
-    save_data(quotes, 'quotes.pickle')
-    save_data(last_message, 'last_message.pickle')
-
-def save_data(data, file):
-    if data is not None:
-        print("Saving to " + file)
-        print(data)
-        with open(file, 'wb') as f:
-            pickle.dump(data, f)
-
-def load_data(file, default):
-    print("Loading " + file + ":")
-    return_value = default
-    if os.path.isfile(file):
-        try:
-            with open(file, 'rb') as f:
-                loaded_data = pickle.load(f)
-                if loaded_data is not None:
-                    print(loaded_data)
-                    return_value = loaded_data
-        except Exception as e:
-            print(f"Exception during pickle load of {file}: {e}")
-        finally:
-            if return_value is None:
-                print("WHY IS NONE")
-            return return_value
-    return return_value
+# Function to save conversation history to a pickle file
+def save_conversation_history():
+    with open('conversation_history.pkl', 'wb') as file:
+        pickle.dump(conversation_history, file)
+        logging.info("Conversation history saved.")
 
 
 
-@bot.event
-async def on_raw_reaction_add(payload):
-    message_id = payload.message_id
-    channel_id = payload.channel_id
-
-    message = await bot.get_channel(channel_id).fetch_message(message_id)
-    reactions = message.reactions
-
-    if len(reactions) > QUOTE_THRESHOLD:
-        if save_quote(message.id, message.author.display_name, message.content, len(reactions)):
-            await message.channel.send("New quote added: " + message.content)
 
 
-# Define an event to track all messages and count interactions with Clyde
-@bot.event
-async def on_message(message: discord.Message):
-
-    await process_message(message)
-
-    # Let the bot process commands as usual
-    await bot.process_commands(message)
+# Initialize conversation history
+conversation_history = load_conversation_history()
 
 
-# Define a command to display a user's Clyde interaction count
-def printInvokeMessage(ctx, method):
-    print(f"{ctx.author} invoked {method}")
+# Load quotes from a pickle file
+def load_quotes():
+    if os.path.exists('quotes.pkl'):
+        with open('quotes.pkl', 'rb') as file:
+            return pickle.load(file)
+    return []
+
+# Save quotes to a pickle file
+def save_quotes(quotes):
+    with open('quotes.pkl', 'wb') as file:
+        pickle.dump(quotes, file)
+        logging.info("Quotes saved.")
+
+# Periodically save quotes
+@tasks.loop(minutes=30)  # Adjust the interval as needed
+async def save_stuff():
+    save_quotes(quotes)
+    save_conversation_history()
 
 
+# Event handler when the bot is ready
 @bot.event
 async def on_ready():
-    print(f'{bot.user.name} has connected to Discord!')
+    logging.info(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
+    logging.info('------')
+    save_stuff.start()
 
-    # Loop through all servers the bot is connected to and store discussions
-    for server in bot.guilds:
-        if server.id not in last_message.keys():
-            last_message[server.id] = None
-        print(f"Replaying discussions for {server.name} since " + str(last_message[server.id]))
-        await replay_discussions(server, last_message[server.id])
-    loop = asyncio.get_event_loop()
-    loop.create_task(save_periodically(interval=300))
+# Event handler for reaction added
+@bot.event
+async def on_reaction_add(reaction, user):
+    if reaction.count > 5:
+        quote = (reaction.message.content, str(reaction.message.author))
+        if quote not in quotes:
+            quotes.append(quote)
+            logging.info(f"Saved a new quote: {quote}")
 
+@bot.command(name='tunk')
+async def imagine_command(ctx):
+    await ctx.send(ai.imagine())
 
-async def get_original_author(message):
-    if message.reference is not None:
-        if message.reference.cached_message is None:
-            # Fetching the message
-            channel = bot.get_channel(message.reference.channel_id)
-            msg = await channel.fetch_message(message.reference.message_id)
-        else:
-            msg = message.reference.cached_message
-        return str(msg.author)
+@bot.command(name='glum')
+async def forget_command(ctx):
+    channel_id = ctx.channel.id
+
+    history = []
+    if channel_id in conversation_history:
+        conversation_history[channel_id] = []
+        response = "jag glum💀"
     else:
-        return None
+        response = "inget att glum💀"
 
-async def process_message(message: discord.Message):
-    global last_message
+    # Mention the user and send the response
+    chat_response = f"{ctx.author.mention}: {response}"  # Mention the user and include the question
+    await ctx.send(chat_response)
 
-    if message.author == bot.user:
-        return
+@bot.command(name='temp')
+async def set_temperature(ctx, temperature: float):
+    """
+    Set the AI temperature for generating responses.
+    Usage: !set_temp <temperature>
+    """
+    ai.set_temperature(temperature)
+    await ctx.send(f"AI temperature set to {temperature}.")
 
-    original_author = await get_original_author(message)
 
-    if original_author is not None:
-        original_author_str = " >> " + str(original_author)
+# Function to generate AI response and handle splitting
+async def generate_and_send_ai_response(author, ctx, question):
+    # Update conversation history for the channel
+    channel_id = ctx.id  # Use ctx.id to get the channel ID
+
+    history = []
+    if channel_id in conversation_history:
+        history = conversation_history[channel_id]
+        print("Found history for this channel: " + str(len(history)))
+
     else:
-        original_author_str = ""
+        conversation_history[channel_id] = []
+        print("Found NO history for this channel!")
 
-    print(f"{message.created_at}: {message.author}: {message.content} ({message.channel.name}){original_author_str}")
+    ai_response = ai.generate_response(question, history)
+    # Split the AI response into parts with a maximum of 1900 characters each
+    max_chars = 1900
+    ai_response_parts = [ai_response[i:i + max_chars] for i in range(0, len(ai_response), max_chars)]
 
-    if message.guild.id not in last_message or last_message[message.guild.id] is None:
-        last_message[message.guild.id] = 0
+    total_parts = len(ai_response_parts)
 
-    if last_message[message.guild.id] < message.id:
-        last_message[message.guild.id] = message.id
+    for i, response_part in enumerate(ai_response_parts, start=1):
+        message_tuple = (question, response_part)
 
-
-
-async def replay_discussions(guild, from_message_id):
-    channel: discord.TextChannel
-
-    for channel in guild.text_channels:
-        # Check if bot has access to the channel
-        bot_member = guild.get_member(bot.user.id)
-        permissions = channel.permissions_for(bot_member)
-        if not permissions.view_channel:
-            continue
-        if from_message_id is None:
-            print("Replaying with limit...")
-            async for message in channel.history(limit=INITIAL_HISTORY_LIMIT):
-                await process_message(message)
+        if channel_id in conversation_history:
+            conversation_history[channel_id].append(message_tuple)
         else:
-            print("Replaying with snowflake...")
-            snowflake: Object = Object(from_message_id)
-            async for message in channel.history(after=snowflake, limit=INITIAL_HISTORY_LIMIT):
-                await process_message(message)
+            conversation_history[channel_id] = [message_tuple]
 
-        print(f"All messages replayed for: {channel.name}")
-    print(f"All messages replayed for: {guild.name}")
+        # Mention the user and send each response part
+        if total_parts > 1:
+            chat_response = f"{author.mention}: ({i}/{total_parts}) {response_part}"  # Mention the user and include the response part and part number
+        else:
+            chat_response = f"{author.mention}: {response_part}"  # Mention the user and include the response part
+
+        await ctx.send(chat_response)  # Use await to send messages
 
 
+# Event listener for bot mentions
+@bot.event
+async def on_message(message):
+    if (bot.user.mentioned_in(message) or ("@kulbot" in str(message.content).lower())) and message.author != bot.user:
+        print("Got bot mention: ")
+        print(message)
+        question = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        # Use await to send messages and await the function
+        await generate_and_send_ai_response(message.author, message.channel, question)
 
+    await bot.process_commands(message)
+
+# Command to send a random quote
 @bot.command(name='quote')
-async def quote(ctx, *, text):
+async def quote_command(ctx):
     """
-    Save a quote to the quote database.
-    Usage: !savequote <quote>
-    """
-    author = None
-    words = text.split()
-    for word in words:
-        if word.endswith(":"):
-            author = word
-            break
-
-    if author is None:
-        author = 'random_idiot'
-
-    quote_str = ' '.join(words)
-    save_quote(time.time_ns, author, quote_str, None)
-    await ctx.send(f'Quote saved from {author}: {quote_str}')
-
-
-def save_quote(msg_id, author, quote_str, reaction_count):
-    global quotes
-    if msg_id not in quotes.keys():
-        quotes[msg_id] = {'text': quote_str, 'reactions': reaction_count, 'author': author}
-        print(f"Quote saved, quote length: {len(quotes)}")
-        return True
-    else:
-        return False
-
-
-@bot.command(name='randomquote')
-async def random_quote(ctx):
-    """
-    Retrieve a random quote from the quote database.
-    Usage: !randomquote
+    Sends a random quote from the saved quotes.
     """
     if not quotes:
-        await ctx.send('No quotes saved yet.')
-        return
-
-    selected_quote = random.choice(quotes)
-    author = selected_quote['author']
-    reactions = selected_quote['reactions']
-    text = selected_quote['text']
-    if reactions > 0:
-        reaction_text = " (" + str(reactions) + " reactions)"
+        await ctx.send("No quotes have been saved yet.")
     else:
-        reaction_text = ""
+        # Select a random quote
+        quote, author = random.choice(quotes)
+        await ctx.send(f"Random Quote: \"{quote}\" - {author}")
 
-    await ctx.send(f'{author}: {text}{reaction_text}')
+# Initialize ChatAI if needed
+ai = ChatAI(AI_SYS_PROMPT)
+ai.init_model()
 
-
-@bot.command(name='clyde')
-async def random_quote(ctx):
-    await ctx.send(f'            Till minne av Clyde\n'
-                   f'                 2023-2023\n'                   
-                   f'"En vänlig AI-assistent som alltid stod till tjänst."')
-
-@bot.command()
-async def start_game(ctx):
-    """Starts the reaction game."""
-    await ctx.send("React with :thumbsup: to win the round!")
-
-    def check(reaction, user):
-        return user != bot.user and str(reaction.emoji) == '👍'
-
-    winner = await bot.wait_for('reaction_add', check=check)
-    await ctx.send(f"{winner[1].name} has won the round!")
-
-
-if __name__ == '__main__':
-    main()
+# Load existing quotes
+quotes = load_quotes()
+# Run the bot with your token
+bot.run(DISCORD_TOKEN)
